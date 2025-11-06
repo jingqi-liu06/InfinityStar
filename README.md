@@ -1,4 +1,4 @@
-# Infinity⭐️: Uniﬁed Spacetime AutoRegressive Modeling for Visual Generation
+# Infinity<span style="color:gold">**⭐️**</span>: Uniﬁed <span style="color:gold">**S**</span>pace<span style="color:gold">**T**</span>ime <span style="color:gold">**A**</span>uto<span style="color:gold">**R**</span>egressive Modeling for Visual Generation
 
 <div align="center">
 
