@@ -5,7 +5,7 @@
 
 [![demo platform](https://img.shields.io/badge/Play%20with%20Infinity%21-Infinity%20demo%20platform-lightblue)](http://opensource.bytedance.com/discord/invite)&nbsp;
 <!-- [![arXiv](https://img.shields.io/static/v1?label=Project%20Page&message=Github&color=blue&logo=github-pages)](https://foundationvision.github.io/infinity.project/)&nbsp; -->
-[![arXiv](https://img.shields.io/badge/arXiv%20paper-2412.04431-b31b1b.svg)](https://arxiv.org/abs/2412.04431)&nbsp;
+[![arXiv](https://img.shields.io/badge/arXiv%20paper-2511.04675-b31b1b.svg)](https://arxiv.org/abs/2511.04675)&nbsp;
 [![huggingface weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-FoundationVision/Infinity-yellow)](https://huggingface.co/FoundationVision/InfinityStar)&nbsp;
 <!-- [![Replicate](https://replicate.com/chenxwh/infinity/badge)](https://replicate.com/chenxwh/infinity)&nbsp; -->
 
@@ -69,14 +69,11 @@ We provide a comprehensive workflow for training and finetuning our model, cover
 If our work assists your research, feel free to give us a star ⭐ or cite us using:
 
 ```
-@misc{han2024infinityscalingbitwiseautoregressive,
-    title={Infinity: Scaling Bitwise AutoRegressive Modeling for High-Resolution Image Synthesis}, 
-    author={Jian Han and Jinlai Liu and Yi Jiang and Bin Yan and Yuqi Zhang and Zehuan Yuan and Bingyue Peng and Xiaobing Liu},
-    year={2024},
-    eprint={2412.04431},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2412.04431}, 
+@article{InfinityStar,
+  title={InfinityStar: Unified Spacetime AutoRegressive Modeling for Visual Generation},
+  author={Jinlai Liu and jian Han and Bin Yan and Hui Wu and Fengda Zhu and Xing Wang and Yi Jiang and Bingyue Peng and Zehuan Yuan},
+  journal={Advances in neural information processing systems},
+  year={2025},
 }
 ```
 
