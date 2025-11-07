@@ -11,7 +11,7 @@
 
 </div>
 <p align="center" style="font-size: larger;">
-  <a href="https://arxiv.org/abs/2412.04431">Infinity⭐️: Uniﬁed Spacetime AutoRegressive Modeling for Visual Generation</a>
+  <a href="http://arxiv.org/abs/2511.04675">Infinity⭐️: Uniﬁed Spacetime AutoRegressive Modeling for Visual Generation</a>
 </p>
 
 
