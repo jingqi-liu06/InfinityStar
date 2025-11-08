@@ -24,7 +24,6 @@ toscli
 *.hydra
 wandb
 *.jpg
-*.png
 *.csv
 *.tar.gz
 *.bin
