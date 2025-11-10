@@ -20,6 +20,7 @@
 <img src="assets/show_images.jpg" width=95%>
 <p> -->
 
+---
 ## 🔥 Updates!!
 * Nov 7, 2025: 🔥 Paper, Training and Inference Codes && Checkpoints && Demo Website released!
 * Sep 18, 2025: 🎉 InfinityStar is accepted as NeurIPS 2025 Oral.
@@ -27,7 +28,6 @@
 ## 🕹️ Try and Play with Infinity⭐️!
 
 We provide a [demo website](http://opensource.bytedance.com/discord/invite) for you to play with InfinityStar and generate videos. Enjoy the fun of bitwise video autoregressive modeling!
-
 
 ## ✨ Overview
 We introduce InfinityStar, a unified spacetime autoregressive framework for high-resolution image and dynamic video synthesis.
