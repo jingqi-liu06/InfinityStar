@@ -1,13 +1,15 @@
+<p align="center">
+  <img src="assets/logo.png" width="400" style="border:none;box-shadow:none;border-radius:0;background:none;">
+<p>
+  
 # Infinity**⭐️**: Uniﬁed **S**pace**T**ime **A**uto**R**egressive Modeling for Visual Generation
 
 
 <div align="center">
 
 [![demo platform](https://img.shields.io/badge/Play%20with%20Infinity%21-Infinity%20demo%20platform-lightblue)](http://opensource.bytedance.com/discord/invite)&nbsp;
-<!-- [![arXiv](https://img.shields.io/static/v1?label=Project%20Page&message=Github&color=blue&logo=github-pages)](https://foundationvision.github.io/infinity.project/)&nbsp; -->
 [![arXiv](https://img.shields.io/badge/arXiv%20paper-2511.04675-b31b1b.svg)](https://arxiv.org/abs/2511.04675)&nbsp;
 [![huggingface weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-FoundationVision/Infinity-yellow)](https://huggingface.co/FoundationVision/InfinityStar)&nbsp;
-<!-- [![Replicate](https://replicate.com/chenxwh/infinity/badge)](https://replicate.com/chenxwh/infinity)&nbsp; -->
 
 </div>
 <p align="center" style="font-size: larger;">
@@ -22,17 +24,9 @@
 * Nov 7, 2025: 🔥 Paper, Training and Inference Codes && Checkpoints && Demo Website released!
 * Sep 18, 2025: 🎉 InfinityStar is accepted as NeurIPS 2025 Oral.
 
-## 🕹️ Try and Play with Infinity!
+## 🕹️ Try and Play with Infinity⭐️!
 
 We provide a [demo website](http://opensource.bytedance.com/discord/invite) for you to play with InfinityStar and generate videos. Enjoy the fun of bitwise video autoregressive modeling!
-
-
-## 📑 Open-Source Plan
-  - [x] Training Code 
-  - [x] Web Demo 
-  - [x] InfinityStar Inference Code
-  - [x] InfinityStar Models Checkpoints
-  - [ ] InfinityStar-Interact Checkpoints & Inference Code
 
 
 ## ✨ Overview
@@ -44,7 +38,7 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
   
 - 🏆 **Leading Performance & Speed**: Through extensive experiments, InfinityStar scores **83.74** on VBench, outperforming all autoregressive models by large margins, even surpassing diffusion competitors like HunyuanVideo, approximately **10x** faster than leading diffusion-based methods.
   
-- 📖 **Pioneering High-Resolution Discrete Generation**: To our knowledge, InfinityStar is the first discrete autoregressive video generator capable of producing industrial-level 720p videos, setting a new standard for quality in its class.
+- 📖 **Pioneering High-Resolution Autoregressive Generation**: To our knowledge, InfinityStar is the first discrete autoregressive video generator capable of producing industrial-level 720p videos, setting a new standard for quality in its class.
 
 
 ### 🔥 Unified modeling for image, video generation and long-duration video synthesis 📈:
@@ -111,6 +105,14 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
     <img src="assets/v2v_examples.png" alt="Video Extrapolation Examples" style="width: 100%;" />
 </div>
 
+
+
+## 📑 Open-Source Plan
+  - [x] Training Code 
+  - [x] Web Demo 
+  - [x] InfinityStar Inference Code
+  - [x] InfinityStar Models Checkpoints
+  - [ ] InfinityStar-Interact Checkpoints & Inference Code
 
 
 ## Installation
