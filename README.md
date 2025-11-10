@@ -14,7 +14,6 @@
   <a href="http://arxiv.org/abs/2511.04675">Infinity⭐️: Uniﬁed Spacetime AutoRegressive Modeling for Visual Generation</a>
 </p>
 
-
 <!-- <p align="center">
 <img src="assets/show_images.jpg" width=95%>
 <p> -->
@@ -53,6 +52,23 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
 <div align="left">
     <img src="assets/framework.png" alt="" style="width: 100%;" />
 </div>
+
+## 🎬 Video Demos
+#### General Aesthetics
+<div align="left">
+<video src="https://github.com/user-attachments/assets/5cb07470-174f-47e3-b89d-c77895c5940d" width="100%" controls autoplay loop></video>
+</div>
+
+####  Anime & 3D Animation
+<div align="left">
+<video src="https://github.com/user-attachments/assets/478e9571-b550-4c23-a567-6fee9a0afb5b" width="100%" controls autoplay loop></video>
+</div>
+
+#### Motion
+<div align="left">
+<video src="https://github.com/user-attachments/assets/adab669b-d38f-4607-9a52-32d8d0bf0e53" width="100%" controls autoplay loop></video>
+</div>
+
 
 ## Benchmark
 
@@ -94,9 +110,6 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
 <div align="left">
     <img src="assets/v2v_examples.png" alt="Video Extrapolation Examples" style="width: 100%;" />
 </div>
-
-## Video Demos
-More video demos are coming soon!
 
 
 
