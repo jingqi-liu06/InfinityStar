@@ -34,14 +34,14 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
 
 - 🧠 **Unified Spacetime Model**: A purely discrete, autoregressive approach that jointly captures spatial and temporal dependencies within a single, elegant architecture.
   
-- 🎬 **Versatile Generation**: This unified design naturally supports a variety of generation tasks such as **text-to-image**, **text-to-video**, **image-to-video**, and **long-duration video synthesis** via straightforward temporal autoregression.
+- 🎬 **Versatile Generation**: This unified design naturally supports a variety of generation tasks such as **text-to-image**, **text-to-video**, **image-to-video**, and **long interactive video synthesis** via straightforward temporal autoregression.
   
 - 🏆 **Leading Performance & Speed**: Through extensive experiments, InfinityStar scores **83.74** on VBench, outperforming all autoregressive models by large margins, even surpassing diffusion competitors like HunyuanVideo, approximately **10x** faster than leading diffusion-based methods.
   
 - 📖 **Pioneering High-Resolution Autoregressive Generation**: To our knowledge, InfinityStar is the first discrete autoregressive video generator capable of producing industrial-level 720p videos, setting a new standard for quality in its class.
 
 
-### 🔥 Unified modeling for image, video generation and long-duration video synthesis 📈:
+### 🔥 Unified modeling for image, video generation and long interactive video synthesis 📈:
 
 <div align="left">
     <img src="assets/framework.png" alt="" style="width: 100%;" />
@@ -61,6 +61,11 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
 #### Motion
 <div align="left">
 <video src="https://github.com/user-attachments/assets/adab669b-d38f-4607-9a52-32d8d0bf0e53" width="100%" controls autoplay loop></video>
+</div>
+
+#### Extended Application: Long Interactive Videos
+<div align="center">
+<video src="https://github.com/user-attachments/assets/411666a6-563d-4551-a3f8-dc5de00436c1" width="100%" controls autoplay loop></video>
 </div>
 
 ## Benchmark
@@ -102,11 +107,6 @@ We introduce InfinityStar, a unified spacetime autoregressive framework for high
 
 <div align="left">
     <img src="assets/v2v_examples.png" alt="Video Extrapolation Examples" style="width: 100%;" />
-</div>
-
-#### Long Interactive Video Synthesis
-<div align="center">
-<video src="https://github.com/user-attachments/assets/411666a6-563d-4551-a3f8-dc5de00436c1" width="100%" controls autoplay loop></video>
 </div>
 
 ## 📑 Open-Source Plan
