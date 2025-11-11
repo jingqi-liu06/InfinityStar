@@ -136,6 +136,11 @@ We provide a comprehensive workflow for training and finetuning our model, cover
     python3 tools/infer_video_480p.py
     ```
 
+*   **480p Long Interactive Video Generation:**
+    Use `tools/infer_interact_480p.py` to generate a long interactive video in 480p. This script supports interactive video generation. You can provide a reference video and multiple prompts. The model will generate a video interactively with your assistance. 
+    ```bash
+    python3 tools/infer_interact_480p.py
+    ```
 
 ## Citation
 If our work assists your research, feel free to give us a star ⭐ or cite us using:

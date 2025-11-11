@@ -89,14 +89,11 @@ def get_ratio2hws_pixels2scales(dynamic_scale_schedule, video_frames):
                 else:
                     dynamic_resolution_h_w[ratio][pn]['video_scales'] = [(int(t), pn[1], pn[2]) for (t, pn) in zip(ts, base_scale_schedule)]
                 del dynamic_resolution_h_w[ratio][pn]['scales']
-    elif dynamic_scale_schedule in ['infinity_elegant_clip20frames_v2']:
+    elif dynamic_scale_schedule in ['infinity_elegant_clip20frames_v2', 'infinity_star_interact']:
         ratio2hws, total_pixels2scales = get_ratio2hws_video_v2()
         ratio2hws = append_dummy_t(ratio2hws)
         dynamic_resolution_h_w = get_full_ratio2hws(ratio2hws, video_frames, total_pixels2scales, predefined_t=None)
-        if 'clip20frames' in dynamic_scale_schedule:
-            compressed_frames_in_one_clip = 20
-        else:
-            compressed_frames_in_one_clip = 8
+        compressed_frames_in_one_clip = 20
         compressed_frames_per_sec = 16 // 4
         duration_resolution = 1
         for ratio in dynamic_resolution_h_w:

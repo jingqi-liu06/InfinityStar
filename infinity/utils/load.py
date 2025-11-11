@@ -19,10 +19,6 @@ def load_visual_tokenizer(args, device=None):
             vae_local = video_vae_model(args.vae_path, schedule_mode, codebook_dim, global_args=args, test_mode=True).to(device)
         else:
             raise ValueError(f"vae_type {args.vae_type} not supported")
-        if args.fake_vae_input:
-            vae_local.encoder = None
-            vae_local.decoder = None
-            torch.cuda.empty_cache()
     else:
         raise ValueError(f"vae_type {args.vae_type} not supported")
     return vae_local

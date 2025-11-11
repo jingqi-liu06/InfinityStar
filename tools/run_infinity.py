@@ -42,7 +42,7 @@ def encode_prompt(t5_path, text_tokenizer, text_encoder, prompt, enable_positive
     print(f'prompt={prompt}')
     captions = [prompt]
     if 'flan-t5' in t5_path:
-        tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
+        tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')
         input_ids = tokens.input_ids.cuda(non_blocking=True)
         mask = tokens.attention_mask.cuda(non_blocking=True)
         text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
@@ -96,6 +96,9 @@ def gen_one_example(
     context_info=None,
     noise_list=None,
     return_summed_code_only=False,
+    mode='',
+    former_clip_features=None,
+    first_frame_features=None,
 ):
     sstt = time.time()
     if not isinstance(cfg_list, list):
@@ -129,11 +132,14 @@ def gen_one_example(
             context_info=context_info,
             noise_list=noise_list,
             return_summed_code_only=return_summed_code_only,
+            mode=mode,
+            former_clip_features=former_clip_features,
+            first_frame_features=first_frame_features,
         )
         if return_summed_code_only:
             return out
         else:
-            _, pred_multi_scale_bit_labels, img_list = out
+            pred_multi_scale_bit_labels, img_list = out
             
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
@@ -220,8 +226,11 @@ def load_transformer(vae, args):
         infinity_test.requires_grad_(False)
         infinity_test.cuda()
         torch.cuda.empty_cache()
-        print(f'============== [Load Infinity weights] ==============')    
 
+        if not model_path:
+            return infinity_test
+        
+        print(f'============== [Load Infinity weights] ==============')    
         if args.checkpoint_type == 'torch':
             state_dict = torch.load(model_path, map_location=device)
             print(infinity_test.load_state_dict(state_dict))
@@ -240,17 +249,6 @@ def load_transformer(vae, args):
     return infinity_test
 
 def images2video(ndarray_image_list, fps=24, save_filepath='tmp.mp4'):
-    if len(ndarray_image_list) == 1:
-        save_filepath = save_filepath.replace('.mp4', '.jpg')
-        cv2.imwrite(save_filepath, ndarray_image_list[0])
-        print(f"Image saved as {osp.abspath(save_filepath)}")
-    else:
-        h, w = ndarray_image_list[0].shape[:2]
-        os.makedirs(osp.dirname(save_filepath), exist_ok=True)
-        imageio.mimsave(save_filepath, ndarray_image_list[:, :, :, ::-1], fps=fps,)
-        print(f"Video saved as {osp.abspath(save_filepath)}")
-    
-def save_video(ndarray_image_list, fps=24, save_filepath='tmp.mp4'):
     if len(ndarray_image_list) == 1:
         save_filepath = save_filepath.replace('.mp4', '.jpg')
         cv2.imwrite(save_filepath, ndarray_image_list[0])

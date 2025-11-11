@@ -163,8 +163,8 @@ class SelfAttention(nn.Module):
             raise ValueError(f'arch {self.arch} not supported')
         
         self.caching = False    # kv caching: only used during inference
-        self.cached_k = []    # kv caching: only used during inference
-        self.cached_v = []    # kv caching: only used during inference
+        self.cached_k = {}    # kv caching: only used during inference
+        self.cached_v = {}    # kv caching: only used during inference
 
         self.use_flex_attn = use_flex_attn
         self.pad_to_multiplier = pad_to_multiplier
@@ -176,11 +176,11 @@ class SelfAttention(nn.Module):
     
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
-        self.cached_k = []
-        self.cached_v = []
+        self.cached_k = {}
+        self.cached_v = {}
 
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, rope2d_freqs_grid=[], scale_schedule=[], scale_ind=0, context_info=None, last_repetition_step=True):
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, rope2d_freqs_grid=[], scale_schedule=[], scale_ind=0, context_info=None, last_repetition_step=True, ref_text_scale_inds=[]):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be sharded (L = raw_seq_len//sp_size)
         :param (fp32) attn_bias_or_two_vector:
@@ -231,29 +231,22 @@ class SelfAttention(nn.Module):
             query_states, key_states = apply_rotary_emb(query_states, key_states, rope2d_freqs_grid)
             if self.caching:    # kv caching: only used during inference
                 if last_repetition_step:
-                    super_fast_mask = False
-                    if super_fast_mask and (scale_schedule[scale_ind][0]>1) and (scale_schedule[scale_ind][-2:] == scale_schedule[-1][-2:]):
-                        full_h, full_w = scale_schedule[-1][-2:]
-                        full_hw = full_h * full_w
-                        self.cached_k.append(key_states[:,:,-full_hw:])
-                        self.cached_v.append(value_states[:,:,-full_hw:])
-                    else:
-                        self.cached_k.append(key_states)
-                        self.cached_v.append(value_states)
-                if scale_ind >= 0:
-                    ref_scale_inds = context_info[scale_ind]['ref_sids']
-                    key_states = torch.cat([self.cached_k[0]] + [self.cached_k[ind+1] for ind in ref_scale_inds] + [key_states], dim=2)
-                    value_states = torch.cat([self.cached_v[0]] + [self.cached_v[ind+1] for ind in ref_scale_inds] + [value_states], dim=2)
+                    self.cached_k[scale_ind] = key_states
+                    self.cached_v[scale_ind] = value_states
+                if isinstance(scale_ind, int):
+                    ref_scale_inds = context_info[scale_ind]['ref_sids'] + ref_text_scale_inds
+                    key_states = torch.cat([self.cached_k[ind] for ind in ref_scale_inds] + [key_states], dim=2)
+                    value_states = torch.cat([self.cached_v[ind] for ind in ref_scale_inds] + [value_states], dim=2)
                 
-                ref_scale_2_last_use_scale = [-1 for _ in range(len(context_info))]
-                for si in range(len(context_info)):
-                    for ref_si in context_info[si]['ref_sids']:
-                        ref_scale_2_last_use_scale[ref_si] = si
-                for ref_si in range(scale_ind):
-                    if (ref_scale_2_last_use_scale[ref_si] < scale_ind) and (self.cached_k[ref_si+1] is not None):
-                        tmpk, tmpv = self.cached_k[ref_si+1], self.cached_v[ref_si+1]
-                        self.cached_k[ref_si+1], self.cached_v[ref_si+1] = None, None
-                        del tmpk, tmpv
+                    ref_scale_2_last_use_scale = [-1 for _ in range(len(context_info))]
+                    for si in range(len(context_info)):
+                        for ref_si in context_info[si]['ref_sids']:
+                            ref_scale_2_last_use_scale[ref_si] = si
+                    for ref_si in range(scale_ind):
+                        if (ref_scale_2_last_use_scale[ref_si] < scale_ind) and (self.cached_k[ref_si] is not None):
+                            tmpk, tmpv = self.cached_k[ref_si], self.cached_v[ref_si]
+                            self.cached_k[ref_si], self.cached_v[ref_si] = None, None
+                            del tmpk, tmpv
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -381,37 +374,18 @@ class SelfAttnBlock(nn.Module):
             raise ValueError(f'arch {self.arch} not supported')
         
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, rope2d_freqs_grid=[], scale_schedule=[], scale_ind=0, context_info=None, last_repetition_step=True):
-        if self.arch == 'qwen':
-            if self.inject_sync:
-                residual = x
-                hidden_states = x
-                hidden_states = self.input_layernorm(hidden_states)
-                torch.cuda.synchronize()
-                hidden_states = self.attn(hidden_states, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step)
-                torch.cuda.synchronize()
-                hidden_states = residual + hidden_states
-                # Fully Connected
-                residual = hidden_states
-                torch.cuda.synchronize()
-                hidden_states = self.post_attention_layernorm(hidden_states)
-                hidden_states = self.mlp(hidden_states)
-                hidden_states = residual + hidden_states
-                torch.cuda.synchronize()
-            else:
-                residual = x
-                hidden_states = x
-                hidden_states = self.input_layernorm(hidden_states)
-                hidden_states = self.attn(hidden_states, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step)
-                hidden_states = residual + hidden_states
-                # Fully Connected
-                residual = hidden_states
-                hidden_states = self.post_attention_layernorm(hidden_states)
-                hidden_states = self.mlp(hidden_states)
-                hidden_states = residual + hidden_states
-            return hidden_states
-        else:
-            raise ValueError(f'arch {self.arch} not supported')
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, rope2d_freqs_grid=[], scale_schedule=[], scale_ind=0, context_info=None, last_repetition_step=True, ref_text_scale_inds=[]):
+        residual = x
+        hidden_states = x
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attn(hidden_states, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step, ref_text_scale_inds)
+        hidden_states = residual + hidden_states
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
     
 
 if __name__ == '__main__':

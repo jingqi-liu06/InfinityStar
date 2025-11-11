@@ -53,13 +53,13 @@ class MultipleLayers(nn.Module):
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
 
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None, scale_ind=None, context_info=None, last_repetition_step=True):
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None, scale_ind=None, context_info=None, last_repetition_step=True, ref_text_scale_inds=[]):
         h = x
         for m in self.module:
             if checkpointing_full_block:
-                h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step, use_reentrant=False)
+                h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step, ref_text_scale_inds, use_reentrant=False)
             else:
-                h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step)
+                h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, rope2d_freqs_grid, scale_schedule, scale_ind, context_info, last_repetition_step, ref_text_scale_inds)
         return h
 
 def get_timestep_embedding(dim, timesteps=1000, max_period=10000):
@@ -214,7 +214,7 @@ class Infinity(nn.Module):
                 tmp_h_div_w_template = self.train_h_div_w_list[0]
                 scales_in_one_clip = self.dynamic_resolution_h_w[tmp_h_div_w_template][self.pn]['scales_in_one_clip']
                 max_video_scales = self.dynamic_resolution_h_w[tmp_h_div_w_template][self.pn]['max_video_scales']
-                if ('infinity_flow' in other_args.dynamic_scale_schedule) or ('infinity_refine' in other_args.dynamic_scale_schedule):
+                if other_args.dynamic_scale_schedule == 'infinity_star_interact':
                     max_scales = 1000
                 else:
                     max_scales = sum(self.image_scale_repetition) + sum(self.video_scale_repetition) * (max_video_scales//scales_in_one_clip-1)
@@ -344,17 +344,16 @@ class Infinity(nn.Module):
                     acc_list = loss_list
             return loss_list, acc_list
     
-    def get_logits_during_infer(self, x_BLC, pt_ph_pw):
+    def get_logits_during_infer(self, x_BLC, is_semantic_scale):
         if self.arch == 'qwen':
             x_BLC = self.norm_hidden_sates(x_BLC)
-        pt, ph, pw = pt_ph_pw
         with torch.amp.autocast('cuda', enabled=False):
             x_BLC = x_BLC.float()
             if self.other_args.use_two_stage_lfq:
-                if ph * pw >= self.detail_scale_min_tokens:
-                    logits = self.head(x_BLC)
-                else:
+                if is_semantic_scale:
                     logits = self.semantic_head2(x_BLC)
+                else:
+                    logits = self.head(x_BLC)
             else:
                 logits = self.head(x_BLC)
         return logits
@@ -517,6 +516,8 @@ class Infinity(nn.Module):
     ):
         if 'infinity_elegant' in args.dynamic_scale_schedule:
             infer_func = self.ar_infer_infinity_elegant
+        elif 'infinity_star_interact' in args.dynamic_scale_schedule:
+            infer_func = self.ar_infer_infinity_star_interact
         else:
             infer_func = self.autoregressive_infer_cfg
         return infer_func(args=args, **kwargs)
@@ -598,9 +599,11 @@ class Infinity(nn.Module):
             last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=-1, context_info=context_info, last_repetition_step=True)
         
         # visual tokens forward
+        ref_text_scale_inds = ['t0']
         last_stage = sos_token
         cum_scales = 0
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            rel_si_in_one_clip = si % scales_in_one_clip
             if si < scales_in_one_clip: # image
                 repeat_times = image_scale_repetition[si%scales_in_one_clip]
                 target_pn = vae_scale_schedule[first_full_spatial_size_scale_index]
@@ -615,8 +618,8 @@ class Infinity(nn.Module):
                 pbar.update(1)
                 last_repetition_step = (repeat_idx == (infer_repeat_times-1))
                 for block_idx, b in enumerate(block_chunks):
-                    last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step)
-                logits_BlV = self.get_logits_during_infer(last_stage, pn).mul(1/tau_list[si])
+                    last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step, ref_text_scale_inds=ref_text_scale_inds)
+                logits_BlV = self.get_logits_during_infer(last_stage, is_semantic_scale=rel_si_in_one_clip < args.semantic_scales).mul(1/tau_list[si])
                 if cfg != 1:
                     # print(f'add cfg on add_cfg_on_logits')
                     if args.use_cfg:
@@ -687,7 +690,205 @@ class Infinity(nn.Module):
         else:
             if low_vram_mode: vae.to('cuda')
             img = self.summed_codes2images(vae, summed_codes)
-            return ret, idx_Bl_list, img
+            return idx_Bl_list, img
+
+
+    @torch.no_grad()
+    def ar_infer_infinity_star_interact(
+        self,
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT=None,
+        B=1, negative_label_B_or_BLT=None,
+        g_seed=None, cfg_list=[], tau_list=[], top_k=0, top_p=0.0,
+        trunk_scale=1000,
+        gt_leak=0, gt_ls_Bl=None,
+        low_vram_mode=False,
+        args=None,
+        get_visual_rope_embeds=None,
+        context_info=None,
+        return_summed_code_only=False,
+        mode='',
+        former_clip_features=None,
+        first_frame_features=None,
+        semantic_scale_ind = 7,
+        detail_frame_inds = [18,19],
+        **kwargs,
+    ):   # returns List[idx_Bl]
+        from infinity.schedules.infinity_star_interact import interpolate
+        assert len(cfg_list) >= len(scale_schedule)
+        assert len(tau_list) >= len(scale_schedule)
+        assert args.use_apg + args.use_cfg == 1
+        device = label_B_or_BLT[0].device
+        if g_seed is None: 
+            rng = None
+        else:
+            self.rng = torch.Generator(device=device)
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
+        
+        if self.apply_spatial_patchify:
+            vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
+        else:
+            vae_scale_schedule = scale_schedule
+        # calculate rope cache for this iteration
+        self.rope2d_freqs_grid['freqs_text'] = self.rope2d_freqs_grid['freqs_text'].to(device)
+        text_maxlen_this_iter = label_B_or_BLT[-1] # self.text_maxlen # kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+        prefix_tokens, _ = self.prepare_text_conditions(label_B_or_BLT, cfg_list, B, negative_label_B_or_BLT, vae_scale_schedule, text_token_only=False, text_maxlen_this_iter=text_maxlen_this_iter)
+        bs = prefix_tokens.shape[0]
+
+        ca_kv, cond_BD_or_gss, attn_mask = None, None, None
+        for b in self.unregistered_blocks: b.attn.kv_caching(True)
+        first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)
+        image_scale_repetition = np.array(json.loads(args.image_scale_repetition))
+        video_scale_repetition = np.array(json.loads(args.video_scale_repetition))
+        scales_in_one_clip = first_full_spatial_size_scale_index + 1
+        assert len(image_scale_repetition) == len(video_scale_repetition), f'{len(image_scale_repetition)} != {len(video_scale_repetition)}'
+        assert len(image_scale_repetition) == scales_in_one_clip, f'{len(image_scale_repetition)} != {scales_in_one_clip}'
+        total_steps = image_scale_repetition.sum() + video_scale_repetition.sum() * (len(scale_schedule)//len(video_scale_repetition)-1) + 1 # +1 is prefix text token forward step
+        if mode == 'second_v_clip':
+            total_steps += 2
+        pbar = tqdm.tqdm(total=total_steps)
+        block_chunks = self.block_chunks if self.num_block_chunks > 1 else self.blocks
+
+        noise_shape = vae_scale_schedule[0]
+        if self.other_args.noise_input:
+            noise = torch.randn((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
+        else:
+            noise = torch.zeros((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
+        
+        summed_codes = [noise[0:1]]
+        sos_token = self.embeds_codes2input(noise, bs//1)
+        # text tokens forward
+        rope_cache = self.rope2d_freqs_grid['freqs_text'][:,:,:,:,:text_maxlen_this_iter]
+        last_stage = prefix_tokens
+        for block_idx, b in enumerate(block_chunks):
+            last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=f't0', context_info=context_info, last_repetition_step=True)
+        pbar.update(1)
+
+        ref_text_scale_inds = ['t0']
+
+        # visual condition forward
+        if mode == 'second_v_clip':
+            assert former_clip_features.shape[-3] == 21
+            former_clip_features = former_clip_features[:,:,1:]
+            last_stage = F.interpolate(former_clip_features, size=(20, *vae_scale_schedule[semantic_scale_ind][-2:]), mode=vae.quantizer.z_interplote_down)
+            rope_cache = get_visual_rope_embeds(self.rope2d_freqs_grid, scale_schedule[-1], last_stage.shape[-3:], list(range(1, 21)), 800, device)
+            last_stage = self.embeds_codes2input(last_stage, bs//B)
+            for block_idx, b in enumerate(block_chunks):
+                last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=f'semantic_condition', context_info=context_info, last_repetition_step=True)
+            pbar.update(1)
+
+            last_stage = torch.cat([first_frame_features, former_clip_features[:,:,detail_frame_inds]], dim=2)
+            rope_cache = get_visual_rope_embeds(self.rope2d_freqs_grid, scale_schedule[-1], last_stage.shape[-3:], [0]+[item+1 for item in detail_frame_inds], 801, device)
+            last_stage = self.embeds_codes2input(last_stage, bs//B)
+            for block_idx, b in enumerate(block_chunks):
+                last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=f'detail_condition', context_info=context_info, last_repetition_step=True)
+            pbar.update(1)
+
+            ref_text_scale_inds.extend(['semantic_condition', 'detail_condition'])
+
+        # visual tokens forward
+        last_stage = sos_token
+        cum_scales = 0
+        for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            rel_si_in_one_clip = si % scales_in_one_clip
+            if si < scales_in_one_clip: # image
+                repeat_times = image_scale_repetition[rel_si_in_one_clip]
+                target_pn = vae_scale_schedule[first_full_spatial_size_scale_index]
+            else:
+                repeat_times = video_scale_repetition[rel_si_in_one_clip]
+                target_pn = vae_scale_schedule[-1]
+            cfg = cfg_list[si]
+            infer_repeat_times = min(repeat_times, args.max_repeat_times)
+            for repeat_idx in range(infer_repeat_times):
+                print(f'real scale ind is : {cum_scales+repeat_idx}')
+                frame_ss, frame_ee = context_info[si]['frame_ss'], context_info[si]['frame_ee']
+                rope_cache = get_visual_rope_embeds(self.rope2d_freqs_grid, scale_schedule[-1], scale_schedule[si], list(range(frame_ss, frame_ee)), cum_scales+repeat_idx, device)
+                last_repetition_step = (repeat_idx == (infer_repeat_times-1))
+                for block_idx, b in enumerate(block_chunks):
+                    last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step, ref_text_scale_inds=ref_text_scale_inds)
+                logits_BlV = self.get_logits_during_infer(last_stage, is_semantic_scale=rel_si_in_one_clip < args.semantic_scales).mul(1/tau_list[si])
+                if cfg != 1:
+                    # print(f'add cfg on add_cfg_on_logits')
+                    if args.use_cfg:
+                        logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+                    elif args.use_apg:
+                        pred_cond = logits_BlV[:B]
+                        pred_uncond = logits_BlV[B:]
+                        pred_guided = normalized_guidance(pred_cond, pred_uncond, guidance_scale=cfg, momentum_buffer=None, eta=0, norm_threshold=args.apg_norm_threshold)
+                        # pred_guided = cfg * pred_cond + (1-cfg) * pred_uncond
+                        logits_BlV = pred_guided
+                else:
+                    logits_BlV = logits_BlV[:B]
+                
+                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                logits_BlV = logits_BlV.reshape(tmp_bs, -1, self.num_of_label_value)
+                probs_Bld = logits_BlV.softmax(dim=-1) # [B, thwd or thw4d, 2]
+                idx_Bld = torch.multinomial(probs_Bld.view(-1, self.num_of_label_value), num_samples=1, replacement=True, generator=rng).view(tmp_bs, -1) # [B, thwd or thw4d]
+                probs_Bld = torch.gather(probs_Bld, dim=2, index=idx_Bld.unsqueeze(-1)).squeeze(-1)
+
+                def Bld2Bthwd(item):
+                    item = item.reshape(tmp_bs, tmp_seq_len, -1) # [B, thw, d or 4d]
+                    item = item.reshape(B, pn[0], pn[1], pn[2], -1) # shape: [B, t, h, w, d] or [B, t, h, w, 4d]
+                    if self.apply_spatial_patchify: # unpatchify operation
+                        item = item.permute(0,1,4,2,3) # [B, t, 4d, h, w]
+                        item = torch.nn.functional.pixel_shuffle(item, 2) # [B, t, d, 2h, 2w]
+                        item = item.permute(0,1,3,4,2) # [B, t, 2h, 2w, d]
+                    return item
+
+                idx_Bld = Bld2Bthwd(idx_Bld)
+                probs_Bld = Bld2Bthwd(probs_Bld)
+
+                if si < gt_leak:
+                    acc = (idx_Bld==gt_ls_Bl[cum_scales+repeat_idx]).float().mean() * 100.
+                    idx_Bld = gt_ls_Bl[cum_scales+repeat_idx]
+                    print(f'{si=} {repeat_idx=} idx_Bld.shape={idx_Bld.shape} {acc=}%')
+
+                # idx_Bld [B, t, h, w, d] or [B, t, 2h, 2w, d]
+                if self.other_args.use_two_stage_lfq:
+                    if si >= args.semantic_scales:
+                        is_semantic_scale = False
+                        lfq = vae.quantizer.lfq_detail
+                    else:
+                        is_semantic_scale = True
+                        lfq = vae.quantizer.lfq_semantic
+                    codes = lfq.indices_to_codes(idx_Bld, 'bit_label')
+                    codes = interpolate(codes, size=(self.vae_embed_dim, *target_pn), mode=vae.quantizer.z_interplote_up, quantizer=vae.quantizer, is_semantic_scale=is_semantic_scale).contiguous()
+                else:
+                    codes = vae.quantizer.lfq_detail.indices_to_codes(idx_Bld, 'bit_label')
+                    codes = F.interpolate(codes, size=target_pn, mode=vae.quantizer.z_interplote_up)
+                summed_codes[-1] = F.interpolate(summed_codes[-1], size=target_pn, mode=vae.quantizer.z_interplote_up)
+                summed_codes[-1] += codes
+                if repeat_idx < repeat_times - 1:
+                    last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si], mode=vae.quantizer.z_interplote_down)
+                    last_stage = self.embeds_codes2input(last_stage, bs//B)
+                pbar.update(1)
+            cum_scales += repeat_times
+            if si < len(scale_schedule)-1:
+                if scale_schedule[si][-2:] == scale_schedule[-1][-2:]:
+                    if self.other_args.noise_input:
+                        summed_codes.append(torch.randn((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
+                    else:
+                        summed_codes.append(torch.zeros((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
+                    last_stage = summed_codes[-1]
+                else:
+                    last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_down)
+                last_stage = self.embeds_codes2input(last_stage, bs//B)
+        summed_codes = torch.cat(summed_codes, dim=-3)
+        for b in self.unregistered_blocks: b.attn.kv_caching(False)
+        if mode == 'second_v_clip':
+            this_clip_frames = summed_codes.shape[2] * 4
+            summed_codes = torch.cat([former_clip_features, summed_codes], dim=-3)
+            img = self.summed_codes2images(vae, summed_codes) # [bs, t, h, w, 3]
+            img = img[:,-this_clip_frames:]
+            summed_codes = summed_codes[:,:,-21:]
+            assert summed_codes.shape[2] == 21, f'wrong shape: {summed_codes.shape=}'
+        else:
+            img = self.summed_codes2images(vae, summed_codes)
+        
+        if low_vram_mode: vae.to('cuda')
+        return summed_codes, img 
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
