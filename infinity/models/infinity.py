@@ -593,7 +593,7 @@ class Infinity(nn.Module):
         last_stage = prefix_tokens
         pbar.update(1)
         for block_idx, b in enumerate(block_chunks):
-            last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=-1, context_info=context_info, last_repetition_step=True)
+            last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind='t0', context_info=context_info, last_repetition_step=True)
         
         # visual tokens forward
         ref_text_scale_inds = ['t0']
