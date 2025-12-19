@@ -58,3 +58,9 @@ shm
 wget-log
 data/interactive_toy_data
 tools/infer_interact_480p.py.bk
+
+#
+eeg_data
+infinity_output_gt/
+infinity_output_gt
+eeg_outputs
