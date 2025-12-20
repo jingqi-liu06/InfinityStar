@@ -167,6 +167,10 @@ def video_encode_global_bsc(
     scales_in_one_clip = dynamic_resolution_h_w[h_div_w_template_list[0]][args.pn]['scales_in_one_clip']
     other_info_by_scale = []
     tokens_remain = tokens_remain-sum(text_lens)
+    
+    # DEBUG: print initial tokens_remain and text_lens
+    print(f"[video_encode_global_bsc] initial tokens_remain={tokens_remain}, text_lens={text_lens}, args.train_max_token_len={args.train_max_token_len}", flush=True)
+
     examples = len(raw_features_list)
     assert len(image_scale_repetition) == len(video_scale_repetition), f'{len(image_scale_repetition)} != {len(video_scale_repetition)}'
     with torch.amp.autocast('cuda', enabled = False):
@@ -213,8 +217,10 @@ def video_encode_global_bsc(
                     keep_video_si = random.randint(image_scale_cnt, video_scale_cnt-1)
                 noise_apply_strength = [noise_prob if i == keep_image_si or i == keep_video_si else 0 for i, noise_prob in enumerate(noise_apply_strength)]
             for si, (pt, ph, pw) in enumerate(vae_scale_schedule):
-                tokens_remain = tokens_remain - np.array(scale_schedule[si]).prod()
+                tokens_consume = np.array(scale_schedule[si]).prod()
+                tokens_remain = tokens_remain - tokens_consume
                 if tokens_remain < 0 and (not args.allow_less_one_elem_in_seq or examples > 1):
+                    print(f"[video_encode_global_bsc] Breaking early at si={si}! tokens_remain={tokens_remain} < 0. tokens_consume={tokens_consume}, valid_scales={valid_scales}", flush=True)
                     valid_scales = si
                     break
                     
@@ -433,8 +439,14 @@ def video_encode_global_bsc(
             # (B,d,t,H,W) -> (B,t,H,W,d)
             var_input_list[i] = var_input_list[i].permute(0,2,3,4,1)
             var_input_list[i] = var_input_list[i].reshape(B, -1, vae.codebook_dim)
-    x_BLC = torch.cat(var_input_list, 1)
-    visual_rope_cache = torch.cat(visual_rope_cache_list, dim=4)
+    
+    if len(var_input_list) == 0:
+        print(f"WARNING: var_input_list is empty! Returning dummy empty tensors. B={B}, device={device}")
+        x_BLC = torch.zeros((B, 0, vae.codebook_dim), device=device)
+    else:
+        x_BLC = torch.cat(var_input_list, 1)
+    
+    visual_rope_cache = torch.cat(visual_rope_cache_list, dim=4) if visual_rope_cache_list else torch.empty(0)
     x_BLC_mask = None
     return x_BLC, x_BLC_mask, gt_BLC, pred_all_bit_indices, visual_rope_cache, sequece_packing_scales, scale_lengths, querysid_refsid, other_info_by_scale
 

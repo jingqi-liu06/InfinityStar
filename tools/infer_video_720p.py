@@ -88,7 +88,8 @@ def perform_inference(pipe, data, args):
 
     generated_image_list = []
     negative_prompt=''
-    prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'
+    # prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'
+    prompt = f'{prompt}'
     negative_prompt = ""
     if args.append_duration2caption:
         prompt = f'<<<t={mapped_duration}s>>>' + prompt
@@ -139,7 +140,7 @@ if __name__ == '__main__':
     # export OPEN_API_KEY="YOUR_API_KEY"
     # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
     enable_rewriter=0
-    checkpoints_dir = './'
+    checkpoints_dir = './checkpoints/'
     
 
     # infer args
@@ -174,8 +175,10 @@ if __name__ == '__main__':
     pipe = InferencePipe(args)
 
     
-    prompt = "A handsome smiling gardener inspecting plants, realistic cinematic lighting, detailed textures, ultra-realistic"
-    image_path = 'assets/reference_image.webp'  # Remove this for Text-to-Video (T2V) generation
+    # prompt = "A handsome smiling gardener inspecting plants, realistic cinematic lighting, detailed textures, ultra-realistic"
+    prompt = "a jellyfish swimming in a tank"
+    # image_path = 'assets/reference_image.webp'  # Remove this for Text-to-Video (T2V) generation
+    image_path = None
     data = {
         'seed': 41,
         'image_path': image_path,
