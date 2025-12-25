@@ -90,6 +90,8 @@ class EEGInferencePipe:
             print("Loading LoRA weights...")
             load_lora_state_dict(self.infinity, checkpoint['lora'])
         
+        # Ensure model is on CUDA (LoRA layers might be on CPU after loading)
+        self.infinity = self.infinity.to('cuda')
         self.infinity.eval()
         
         # Build EEG projector
@@ -157,9 +159,16 @@ class EEGInferencePipe:
         )
         
         # Apply text_norm and text_proj (matching Infinity's text processing)
-        kv_compact = self.infinity.text_norm(eeg_embeddings.reshape(-1, 2048))
-        kv_compact = self.infinity.text_proj(kv_compact).contiguous()
+        # kv_compact = self.infinity.text_norm(eeg_embeddings.reshape(-1, 2048))
+        # kv_compact = self.infinity.text_proj(kv_compact).contiguous()
         
+        # FIX: Do NOT apply text_norm and text_proj here!
+        # The Infinity model applies these internally after CFG/drop-cond logic.
+        # We must pass the raw 2048-dim embeddings.
+        kv_compact = eeg_embeddings.reshape(-1, 2048).contiguous()
+        
+        print(f"DEBUG: prepare_eeg_condition returning kv_compact shape: {kv_compact.shape}")
+
         text_cond_tuple = (kv_compact, lens, cu_seqlens_k, seq_len)
         
         return text_cond_tuple
@@ -218,6 +227,10 @@ class EEGInferencePipe:
         # Prepare EEG condition
         text_cond_tuple = self.prepare_eeg_condition(eeg_features, batch_size=1)
         
+        # DEBUG: Print shape before infer
+        kv_compact_check = text_cond_tuple[0]
+        print(f"DEBUG: EEG latent shape before infer: {kv_compact_check.shape}")
+        
         # Prepare negative condition (using cfg_uncond)
         negative_label_B_or_BLT = None
         if negative_prompt:
@@ -264,9 +277,24 @@ class EEGInferencePipe:
                 context_info=context_info,
             )
         
+        # Post-process generated video shape
+        # Match logic from infer_video_720p.py lines 122-127
+        if len(generated_video.shape) == 3:
+             generated_video = generated_video.unsqueeze(0)
+        
+        # infer_video_720p.py does generated_image_list append and cat, 
+        # but here we might already have the full tensor.
+        # Ensure it is on CPU and numpy
+        
         elapsed_time = time.time() - start_time
         print(f"Generation completed in {elapsed_time:.2f}s")
         
+        # Convert to numpy array if it's a tensor
+        if isinstance(generated_video, torch.Tensor):
+            generated_video = generated_video.cpu().numpy()
+            
+        print(f"DEBUG: generated_video shape before save: {generated_video.shape}")
+            
         return generated_video
 
 
@@ -298,9 +326,9 @@ def main():
     parser = argparse.ArgumentParser(description='EEG-to-Video Inference')
     
     # Model paths
-    parser.add_argument('--checkpoint_dir', type=str, default='./',
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints/',
                         help='Directory containing model checkpoints')
-    parser.add_argument('--eeg_checkpoint', type=str, required=True,
+    parser.add_argument('--eeg_checkpoint', type=str, default='./eeg_lora_checkpoints/sub5/checkpoint_best.pth',
                         help='Path to EEG-LoRA checkpoint')
     
     # EEG input
@@ -335,7 +363,7 @@ def main():
     args.pn = '0.40M'
     args.fps = 16
     args.video_frames = int(cli_args.duration * 16) + 1
-    args.model_path = os.path.join(cli_args.checkpoint_dir, 'infinitystar_8b_480p_weights')
+    args.model_path = os.path.join(cli_args.checkpoint_dir, 'infinitystar_8b_720p_weights')
     args.checkpoint_type = 'torch_shard'
     args.vae_path = os.path.join(cli_args.checkpoint_dir, 'infinitystar_videovae.pth')
     args.text_encoder_ckpt = os.path.join(cli_args.checkpoint_dir, 'text_encoder/flan-t5-xl-official/')
@@ -385,7 +413,13 @@ def main():
         f'eeg_{cli_args.eeg_idx}_seed_{cli_args.seed}_{cli_args.duration}s.mp4'
     )
     
-    save_video(generated_video, output_path, fps=16)
+    # Remove batch dimension for save_video which expects [T, H, W, C]
+    if len(generated_video.shape) == 5 and generated_video.shape[0] == 1:
+        generated_video_to_save = generated_video[0]
+    else:
+        generated_video_to_save = generated_video
+
+    save_video(generated_video_to_save, fps=16, save_filepath=output_path)
     print(f"Saved video to {output_path}")
 
 
@@ -431,7 +465,14 @@ def batch_inference(
             )
             
             output_path = os.path.join(output_dir, f'eeg_{idx:04d}.mp4')
-            save_video(generated_video, output_path, fps=16)
+            
+            # Remove batch dimension for save_video
+            if len(generated_video.shape) == 5 and generated_video.shape[0] == 1:
+                generated_video_to_save = generated_video[0]
+            else:
+                generated_video_to_save = generated_video
+                
+            save_video(generated_video_to_save, fps=16, save_filepath=output_path)
             
         except Exception as e:
             print(f"Error generating video for sample {idx}: {e}")
