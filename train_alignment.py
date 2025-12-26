@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+# Copyright (c) 2025 FoundationVision
+# SPDX-License-Identifier: MIT
+
+"""
+Training script for EEG-Text Alignment (Stage 1) - Optimized.
+
+This script trains the EEG Projector to align EEG features with T5 text embeddings.
+It uses a combination of MSE Loss (reconstruction) and Contrastive Loss (InfoNCE).
+
+Optimizations:
+1. Pre-computes T5 embeddings for all captions to avoid re-running T5 during training.
+2. Pre-loads EEG data to GPU memory.
+"""
+
+import argparse
+import os
+import sys
+import time
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import wandb
+from tqdm import tqdm
+
+# Add project root to path
+sys.path.append(os.getcwd())
+
+from infinity.models.eeg_projector import build_eeg_projector
+from infinity.dataset.dataset_alignment import EEGAlignmentDataset, collate_alignment_batch
+from tools.run_infinity import load_tokenizer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train EEG-Text Alignment")
+    
+    # Data paths
+    parser.add_argument('--eeg_tokenizer_path', type=str, required=True,
+                        help='Path to EEG tokenizer output .pt file')
+    parser.add_argument('--video_gt_root', type=str, required=True,
+                        help='Root directory for videos (for alignment verification)')
+    parser.add_argument('--caption_root', type=str, required=True,
+                        help='Root directory for captions')
+    parser.add_argument('--text_encoder_ckpt', type=str, required=True,
+                        help='Path to T5 text encoder checkpoint')
+    
+    # Projector config
+    parser.add_argument('--eeg_dim', type=int, default=14880, help='Input EEG dimension')
+    parser.add_argument('--eeg_seq_len', type=int, default=64, help='Output sequence length')
+    parser.add_argument('--eeg_hidden_dim', type=int, default=4096, help='Hidden dimension')
+    parser.add_argument('--eeg_num_layers', type=int, default=2, help='Number of layers')
+    parser.add_argument('--eeg_projector_type', type=str, default='mlp', choices=['mlp', 'cross_attention'])
+    parser.add_argument('--dropout', type=float, default=0.1)
+    
+    # Training config
+    parser.add_argument('--output_dir', type=str, default='./checkpoints/alignment', help='Output directory')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--log_freq', type=int, default=10)
+    parser.add_argument('--save_freq', type=int, default=10)
+    parser.add_argument('--preload_data', action='store_true', default=True, help='Preload EEG data to GPU')
+    
+    # Loss config
+    parser.add_argument('--temperature', type=float, default=0.07, help='Temperature for contrastive loss')
+    parser.add_argument('--lambda_nce', type=float, default=1.0, help='Weight for NCE loss')
+    parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE loss')
+    
+    # Wandb config
+    parser.add_argument('--project_name', type=str, default='EEG-Alignment', help='Wandb project name')
+    parser.add_argument('--exp_name', type=str, default='mlp_align', help='Wandb experiment name')
+    
+    return parser.parse_args()
+
+
+def contrastive_loss(eeg_feats, text_feats, temperature=0.07):
+    """
+    Compute Contrastive Loss (InfoNCE).
+    
+    Args:
+        eeg_feats: (B, D) Normalized EEG features
+        text_feats: (B, D) Normalized Text features
+        temperature: Temperature scaling factor
+        
+    Returns:
+        loss: Scalar loss
+    """
+    # Cosine similarity matrix: (B, B)
+    logits = torch.matmul(eeg_feats, text_feats.T) / temperature
+    
+    # Labels: diagonal are positives (0, 1, 2, ...)
+    labels = torch.arange(logits.size(0), device=logits.device)
+    
+    # Cross entropy loss (symmetric)
+    loss_e2t = F.cross_entropy(logits, labels)
+    loss_t2e = F.cross_entropy(logits.T, labels)
+    
+    return (loss_e2t + loss_t2e) / 2
+
+
+def precompute_text_embeddings(dataset, tokenizer, text_encoder, device, batch_size=32):
+    """
+    Pre-compute T5 embeddings for all unique captions in the dataset.
+    """
+    print("Pre-computing text embeddings for caching...")
+    unique_captions = sorted(list(set(dataset.captions)))
+    # Filter out empty strings
+    unique_captions = [c for c in unique_captions if c.strip()]
+    
+    cache = {}
+    
+    # Process in batches
+    for i in tqdm(range(0, len(unique_captions), batch_size), desc="Caching Text Embeddings"):
+        batch_captions = unique_captions[i:i+batch_size]
+        
+        with torch.no_grad():
+            text_tokens = tokenizer(
+                batch_captions,
+                padding='max_length',
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            ).to(device)
+            
+            text_outputs = text_encoder(
+                input_ids=text_tokens.input_ids,
+                attention_mask=text_tokens.attention_mask
+            )
+            # We need to store both embeddings and mask
+            # Move to CPU to save GPU memory if dataset is huge, 
+            # but for 1400 samples, keeping on GPU is fine and faster.
+            # Let's keep on GPU for max speed since we have few captions.
+            text_emb = text_outputs['last_hidden_state'] # (B, L, 2048)
+            text_mask = text_tokens.attention_mask.unsqueeze(-1) # (B, L, 1)
+            
+            for j, caption in enumerate(batch_captions):
+                cache[caption] = (text_emb[j], text_mask[j])
+                
+    print(f"Cached embeddings for {len(cache)} unique captions.")
+    return cache
+
+
+def train(args):
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Initialize Wandb
+    wandb.init(
+        project=args.project_name,
+        name=args.exp_name,
+        config=vars(args)
+    )
+    
+    # Load Text Encoder (Frozen) - Only for pre-computation
+    print("Loading Text Encoder...")
+    tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
+    text_encoder.to(device)
+    text_encoder.eval()
+    
+    # Initial dataset load (to get captions)
+    print("Loading Dataset Metadata...")
+    # Temporarily create dataset without preload to scan captions
+    temp_dataset = EEGAlignmentDataset(
+        eeg_tokenizer_path=args.eeg_tokenizer_path,
+        caption_root=args.caption_root,
+        video_root=args.video_gt_root,
+        split="train",
+        seed=args.seed,
+        preload_to_gpu=False
+    )
+    
+    # Pre-compute text embeddings
+    cached_embeddings = precompute_text_embeddings(
+        temp_dataset, tokenizer, text_encoder, device, batch_size=args.batch_size
+    )
+    
+    # Unload text encoder to free up GPU memory
+    del text_encoder
+    del tokenizer
+    torch.cuda.empty_cache()
+    print("Text Encoder unloaded to save memory.")
+    
+    # Re-initialize dataset with cache and preloading
+    print("Initializing Optimized Dataset...")
+    dataset = EEGAlignmentDataset(
+        eeg_tokenizer_path=args.eeg_tokenizer_path,
+        caption_root=args.caption_root,
+        video_root=args.video_gt_root,
+        split="train",
+        seed=args.seed,
+        preload_to_gpu=args.preload_data,
+        device=device,
+        cached_text_embeddings=cached_embeddings
+    )
+    
+    # DataLoader
+    # Note: num_workers=0 is usually faster if data is already on GPU
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0 if args.preload_data else args.num_workers,
+        collate_fn=collate_alignment_batch,
+        drop_last=True
+    )
+    
+    # Build EEG Projector
+    print("Building EEG Projector...")
+    projector = build_eeg_projector(
+        projector_type=args.eeg_projector_type,
+        eeg_dim=args.eeg_dim,
+        t5_dim=2048,  # Flan-T5-XL dimension
+        seq_len=args.eeg_seq_len,
+        hidden_dim=args.eeg_hidden_dim,
+        num_layers=args.eeg_num_layers,
+        dropout=args.dropout
+    )
+    projector.to(device)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        projector.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    
+    print(f"Start training for {args.epochs} epochs...")
+    best_loss = float('inf')
+    
+    for epoch in range(args.epochs):
+        projector.train()
+        epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_nce = 0.0
+        steps = 0
+        
+        start_time = time.time()
+        
+        for batch in dataloader:
+            optimizer.zero_grad()
+            
+            # Data is likely already on GPU if preloaded
+            eeg_features = batch['eeg_features'].to(device).float() # (B, 14880)
+            
+            # 1. Forward Pass Projector
+            eeg_emb = projector(eeg_features) # (B, Seq, 2048)
+            
+            # 2. Get Cached Text Embeddings
+            # They should be in batch dict if everything went right
+            if 'text_embeddings' not in batch:
+                # Skip batch if no embeddings (e.g. all empty captions)
+                continue
+                
+            text_emb = batch['text_embeddings'].to(device) # (B, L, 2048)
+            text_mask = batch['text_masks'].to(device)     # (B, L, 1)
+            
+            # 3. Compute Global Average Pooling for Alignment
+            # EEG GAP: Mean over sequence
+            eeg_gap = eeg_emb.mean(dim=1) # (B, 2048)
+            
+            # Text GAP: Mean over valid tokens
+            text_sum = (text_emb * text_mask).sum(dim=1)
+            text_lens = text_mask.sum(dim=1).clamp(min=1.0)
+            text_gap = text_sum / text_lens # (B, 2048)
+            
+            # 4. Compute Losses
+            # MSE Loss (Reconstruction)
+            mse_loss = F.mse_loss(eeg_gap, text_gap)
+            
+            # Contrastive Loss (InfoNCE)
+            # Normalize for cosine similarity
+            eeg_norm = F.normalize(eeg_gap, p=2, dim=-1)
+            text_norm = F.normalize(text_gap, p=2, dim=-1)
+            nce_loss = contrastive_loss(eeg_norm, text_norm, temperature=args.temperature)
+            
+            # Total Loss
+            loss = (args.lambda_mse * mse_loss) + (args.lambda_nce * nce_loss)
+            
+            loss.backward()
+            optimizer.step()
+            
+            # Logging
+            epoch_loss += loss.item()
+            epoch_mse += mse_loss.item()
+            epoch_nce += nce_loss.item()
+            steps += 1
+            
+            if steps % args.log_freq == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} Step {steps}: "
+                      f"Loss={loss.item():.4f} (MSE={mse_loss.item():.4f}, NCE={nce_loss.item():.4f})")
+                
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/mse_loss": mse_loss.item(),
+                    "train/nce_loss": nce_loss.item(),
+                    "train/epoch": epoch + 1,
+                    "train/step": epoch * len(dataloader) + steps
+                })
+        
+        # End of epoch stats
+        if steps > 0:
+            avg_loss = epoch_loss / steps
+            avg_mse = epoch_mse / steps
+            avg_nce = epoch_nce / steps
+            duration = time.time() - start_time
+            
+            print(f"Epoch {epoch+1} Done. Time: {duration:.2f}s")
+            print(f"Avg Loss: {avg_loss:.4f} (MSE: {avg_mse:.4f}, NCE: {avg_nce:.4f})")
+            
+            wandb.log({
+                "epoch/avg_loss": avg_loss,
+                "epoch/avg_mse": avg_mse,
+                "epoch/avg_nce": avg_nce,
+            })
+            
+            # Save checkpoints
+            save_path = os.path.join(args.output_dir, "checkpoint_latest.pth")
+            torch.save({
+                'epoch': epoch,
+                'projector': projector.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss': avg_loss
+            }, save_path)
+            
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_path = os.path.join(args.output_dir, "checkpoint_best.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'projector': projector.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': avg_loss
+                }, best_path)
+                print(f"New best model saved to {best_path}")
+                
+            if (epoch + 1) % args.save_freq == 0:
+                periodic_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'projector': projector.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': avg_loss
+                }, periodic_path)
+    
+    wandb.finish()
+
+if __name__ == "__main__":
+    args = parse_args()
+    train(args)
