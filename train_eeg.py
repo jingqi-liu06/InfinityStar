@@ -39,6 +39,8 @@ from torch.profiler import record_function
 from torch.utils.data import DataLoader
 import torch.distributed as tdist
 
+from tools.run_infinity import load_tokenizer  # Import for text encoder loading
+
 import infinity.utils.dist as dist
 from infinity.utils.save_and_load import CKPTSaver, omnistoreCheckpoint, auto_resume
 from infinity.models.ema import get_ema_model
@@ -110,6 +112,8 @@ def add_eeg_args(parser):
                         help='Learning rate for LoRA parameters')
     parser.add_argument('--use_concat_eeg', type=int, default=1,
                         help='Use concatenated EEG features (14880) vs per-window (2, 7440)')
+    parser.add_argument('--text_encoder_ckpt', type=str, default='./checkpoints/text_encoder/flan-t5-xl-official/',
+                        help='Path to text encoder checkpoint for alignment loss')
     
     return parser
 
@@ -301,7 +305,23 @@ def build_everything_from_args(args):
     eeg_proj_for_opt = eeg_projector.module if hasattr(eeg_projector, 'module') else eeg_projector
     optimizer = build_optimizer_for_eeg_lora(args, eeg_proj_for_opt, gpt_for_opt)
     
-    return vae_local, gpt_wo_ddp, gpt_ddp, eeg_projector, optimizer
+    # Load Text Encoder for Alignment Loss
+    tokenizer = None
+    text_encoder = None
+    if hasattr(args, 'text_encoder_ckpt') and args.text_encoder_ckpt:
+        print(f"Loading Text Encoder from {args.text_encoder_ckpt} for alignment supervision...")
+        try:
+            tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
+            text_encoder.to(args.device)
+            text_encoder.eval()
+            for p in text_encoder.parameters():
+                p.requires_grad = False
+            print("[Text Encoder] Loaded and frozen.")
+        except Exception as e:
+            print(f"[Text Encoder] Failed to load: {e}")
+            print("[Text Encoder] Alignment loss will be disabled.")
+    
+    return vae_local, gpt_wo_ddp, gpt_ddp, eeg_projector, optimizer, tokenizer, text_encoder
 
 
 def build_eeg_dataset(args):
@@ -334,7 +354,9 @@ def train_step_eeg(
     device: torch.device,
     self_correction: Optional[object] = None,
     grad_clip: float = 1.0,
-) -> Tuple[float, float]:
+    tokenizer=None,
+    text_encoder=None,
+) -> Tuple[float, float, float]:
     """
     Single training step for EEG-to-Video.
     
@@ -349,9 +371,11 @@ def train_step_eeg(
         device: Device
         self_correction: SelfCorrection object
         grad_clip: Gradient clipping value
+        tokenizer: Text tokenizer for alignment loss
+        text_encoder: Text encoder for alignment loss
         
     Returns:
-        Tuple of (loss, accuracy)
+        Tuple of (loss, accuracy, total_norm)
     """
     optimizer.zero_grad()
     
@@ -395,6 +419,61 @@ def train_step_eeg(
     with torch.cuda.amp.autocast(enabled=False):
         eeg_features_f32 = eeg_features.float()
         eeg_embeddings = eeg_projector(eeg_features_f32)  # (B, seq_len, 2048)
+    
+    # Calculate Alignment Loss
+    alignment_loss = 0.0
+    if tokenizer is not None and text_encoder is not None and 'captions' in batch:
+        captions = batch['captions']
+        # Filter out empty captions if any
+        valid_indices = [i for i, c in enumerate(captions) if c and isinstance(c, str)]
+        
+        if valid_indices:
+            valid_captions = [captions[i] for i in valid_indices]
+            
+            # Tokenize captions
+            # Note: We need to handle potential length mismatches carefully.
+            # Here we rely on global average pooling for alignment, so length doesn't need to match exactly.
+            with torch.no_grad():
+                text_tokens = tokenizer(
+                    valid_captions, 
+                    padding='max_length', 
+                    truncation=True, 
+                    max_length=512, # Standard T5 max length
+                    return_tensors="pt"
+                ).to(device)
+                
+                # Get T5 embeddings
+                text_outputs = text_encoder(
+                    input_ids=text_tokens.input_ids, 
+                    attention_mask=text_tokens.attention_mask
+                )
+                gt_text_embeddings = text_outputs['last_hidden_state'] # (B_valid, L_text, 2048)
+                text_mask = text_tokens.attention_mask.unsqueeze(-1) # (B_valid, L_text, 1)
+            
+            # Get corresponding EEG embeddings
+            valid_eeg_embeddings = eeg_embeddings[valid_indices] # (B_valid, L_eeg, 2048)
+            
+            # Compute Global Average Pooling (GAP) for Alignment
+            # GAP for Text: Mean over valid tokens
+            text_sum = (gt_text_embeddings * text_mask).sum(dim=1)
+            text_lens = text_mask.sum(dim=1).clamp(min=1.0)
+            text_gap = text_sum / text_lens # (B_valid, 2048)
+            
+            # GAP for EEG: Mean over all tokens
+            eeg_gap = valid_eeg_embeddings.mean(dim=1) # (B_valid, 2048)
+            
+            # L2 Normalize both vectors for stable cosine similarity
+            eeg_gap_norm = F.normalize(eeg_gap, p=2, dim=-1)
+            text_gap_norm = F.normalize(text_gap, p=2, dim=-1)
+            
+            # Alignment Loss: 1 - Cosine Similarity (range [0, 2])
+            # This is more stable than MSE and encourages directional alignment
+            cosine_sim = F.cosine_similarity(eeg_gap_norm, text_gap_norm, dim=-1)
+            alignment_loss = (1.0 - cosine_sim).mean()
+            
+            print(f"[R{rk}] Alignment Loss: {alignment_loss.item():.4f}, Cosine Sim: {cosine_sim.mean().item():.4f}", flush=True)
+        else:
+             print(f"[R{rk}] Warning: No valid captions for alignment loss.", flush=True)
     
     # Ensure output is cast back to what the rest of the model expects if needed, 
     # but for now keeping it float for the text_norm/proj checks is fine.
@@ -674,10 +753,17 @@ def train_step_eeg(
     print(f"[R{rk}] GPT forward done. loss_list: {loss_list.shape}", flush=True)
     
     # Compute loss (mean over sequence)
-    loss = loss_list.mean()
+    video_loss = loss_list.mean()
     acc = acc_list.mean()
     
-    print(f"[R{rk}] loss={loss.item():.4f}, acc={acc.item():.4f}", flush=True)
+    # Total loss
+    # alpha controls the strength of alignment supervision
+    # Lower alpha (0.1) to balance with video loss (~0.67)
+    alpha = 0.1 
+    loss = video_loss + alpha * alignment_loss
+    
+    align_val = alignment_loss.item() if isinstance(alignment_loss, torch.Tensor) else alignment_loss
+    print(f"[R{rk}] loss={loss.item():.4f} (video={video_loss.item():.4f}, align={align_val:.4f}, weighted_align={alpha * align_val:.4f}), acc={acc.item():.4f}", flush=True)
     
     # Check for NaN/Inf before backward (helps debug numerical issues)
     if not torch.isfinite(loss):
@@ -717,7 +803,7 @@ def main_train(args):
     """Main training loop."""
     # Build everything
     ret = build_everything_from_args(args)
-    vae_local, gpt_wo_ddp, gpt_ddp, eeg_projector, optimizer = ret
+    vae_local, gpt_wo_ddp, gpt_ddp, eeg_projector, optimizer, tokenizer, text_encoder = ret
     
     # Get video encode function
     video_encode, _, _, _ = get_encode_decode_func(args.dynamic_scale_schedule)
@@ -809,6 +895,8 @@ def main_train(args):
                     device=args.device,
                     self_correction=self_correction,
                     grad_clip=args.grad_clip,
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
                 )
             except Exception as e:
                 print(f"[ERROR] batch_idx={batch_idx}, error: {e}")
@@ -963,6 +1051,8 @@ def parse_eeg_args_from_argv():
     parser.add_argument('--lora_dropout', type=float, default=0.05)
     parser.add_argument('--lora_target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj')
     
+    parser.add_argument('--text_encoder_ckpt', type=str, default='./checkpoints/text_encoder/flan-t5-xl-official/')
+
     # Training config
     parser.add_argument('--eeg_projector_lr', type=float, default=1e-4)
     parser.add_argument('--lora_lr', type=float, default=1e-4)
@@ -994,6 +1084,7 @@ def main():
     args.lora_alpha = eeg_args.lora_alpha
     args.lora_dropout = eeg_args.lora_dropout
     args.lora_target_modules = eeg_args.lora_target_modules
+    args.text_encoder_ckpt = eeg_args.text_encoder_ckpt
     args.eeg_projector_lr = eeg_args.eeg_projector_lr
     args.lora_lr = eeg_args.lora_lr
     args.use_concat_eeg = eeg_args.use_concat_eeg
