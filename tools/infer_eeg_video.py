@@ -231,28 +231,17 @@ class EEGInferencePipe:
         kv_compact_check = text_cond_tuple[0]
         print(f"DEBUG: EEG latent shape before infer: {kv_compact_check.shape}")
         
-        # Prepare negative condition (using cfg_uncond)
+        # Prepare negative condition (using Null EEG for consistent latent space)
+        # This ensures CFG operates in the same projected EEG space
         negative_label_B_or_BLT = None
-        if negative_prompt:
-            # Use text encoder for negative prompt
-            tokens = self.text_tokenizer(
-                text=[negative_prompt],
-                max_length=self.text_tokenizer.model_max_length,
-                padding='max_length',
-                truncation=True,
-                return_tensors='pt'
-            )
-            input_ids = tokens.input_ids.cuda()
-            mask = tokens.attention_mask.cuda()
-            neg_text_features = self.text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-            neg_lens = mask.sum(dim=-1).tolist()
-            neg_cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-            neg_Ltext = max(neg_lens)
-            neg_kv_compact = []
-            for i, (len_i, feat_i) in enumerate(zip(neg_lens, neg_text_features.unbind(0))):
-                neg_kv_compact.append(feat_i[:len_i])
-            neg_kv_compact = torch.cat(neg_kv_compact, dim=0)
-            negative_label_B_or_BLT = (neg_kv_compact, neg_lens, neg_cu_seqlens_k, neg_Ltext)
+        
+        # Create null EEG features (zeros)
+        # Note: eeg_features is already (1, ...) from main/batch_inference
+        null_eeg_features = torch.zeros_like(eeg_features)
+        
+        # Get negative condition tuple using same helper
+        print("Using Null EEG for negative condition (CFG consistency).")
+        negative_label_B_or_BLT = self.prepare_eeg_condition(null_eeg_features, batch_size=1)
         
         # Set random seed
         torch.manual_seed(seed)
@@ -328,7 +317,7 @@ def main():
     # Model paths
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints/',
                         help='Directory containing model checkpoints')
-    parser.add_argument('--eeg_checkpoint', type=str, default='./eeg_lora_checkpoints/sub5/checkpoint_best.pth',
+    parser.add_argument('--eeg_checkpoint', type=str, default='./eeg_lora_checkpoints/sub1/checkpoints/checkpoint_best.pth',
                         help='Path to EEG-LoRA checkpoint')
     
     # EEG input

@@ -41,7 +41,7 @@ export OMP_NUM_THREADS=8
 # Training Loop for Subjects 1-21
 # ============================================================================
 
-for i in {1..20}; do
+for i in {1..1}; do
     sub_id="sub${i}"
     echo -e "\033[1;32m========================================================\033[0m"
     echo -e "\033[1;32mStarting training for Subject: ${sub_id}\033[0m"
@@ -141,7 +141,7 @@ for i in {1..20}; do
         --token_cache_dir=${token_cache_dir} \
         --pn 0.40M \
         --model=infinity_qwen8b \
-        --project_name=eeg_to_video \
+        --project_name=EEG2Video-LoRA \
         --exp_name=${exp_name} \
         --checkpoint_type='torch' \
         --enable_checkpointing=full-block \
@@ -173,6 +173,7 @@ for i in {1..20}; do
         --workers=4 \
         --torchshard_resume=${resume_path} \
         --eeg_tokenizer_path=${eeg_tokenizer_path} \
+        --text_encoder_ckpt=${t5_path} \
         --video_gt_root=${video_gt_root} \
         --caption_root=${caption_root} \
         --eeg_dim=${eeg_dim} \
