@@ -119,13 +119,16 @@ def gen_one_example(
     mode='',
     former_clip_features=None,
     first_frame_features=None,
+    text_cond_tuple=None,
 ):
     sstt = time.time()
     if not isinstance(cfg_list, list):
         cfg_list = [cfg_list] * len(scale_schedule)
     if not isinstance(tau_list, list):
         tau_list = [tau_list] * len(scale_schedule)
-    text_cond_tuple = encode_prompt(args.text_encoder_ckpt, text_tokenizer, text_encoder, prompt, enable_positive_prompt, low_vram_mode=low_vram_mode)
+    # Use pre-computed text_cond_tuple if provided, otherwise encode prompt
+    if text_cond_tuple is None:
+        text_cond_tuple = encode_prompt(args.text_encoder_ckpt, text_tokenizer, text_encoder, prompt, enable_positive_prompt, low_vram_mode=low_vram_mode)
     if negative_prompt:
         negative_label_B_or_BLT = encode_prompt(args.text_encoder_ckpt, text_tokenizer, text_encoder, negative_prompt, low_vram_mode=low_vram_mode)
     else:

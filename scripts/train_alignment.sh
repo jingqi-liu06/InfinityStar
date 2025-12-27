@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0  # Set GPU ID
 # Data Configuration
 sub_id="sub9"
 data_root="./eeg_data"
-output_root="./checkpoints/alignment"
+output_root="./checkpoints_alignment"
 
 # Paths
 eeg_tokenizer_path="./eeg_outputs/${sub_id}_quant.pt"
@@ -31,14 +31,14 @@ eeg_num_layers=2
 projector_type="mlp"
 
 # Training Configuration
-batch_size=32
+batch_size=96
 epochs=200
 lr=1e-3
 log_freq=10
 save_freq=50
 
 # Output Directory
-exp_name="${sub_id}_mlp_align"
+exp_name="${sub_id}_mlp_align-clip"
 output_dir="${output_root}/${exp_name}"
 
 echo "Starting Alignment Training for ${sub_id}..."

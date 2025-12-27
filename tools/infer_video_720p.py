@@ -23,6 +23,42 @@ from infinity.schedules import get_encode_decode_func
 from infinity.utils.arg_util import Args
 
 
+def load_and_prepare_eeg_latents(eeg_latents_path, sample_idx, device='cuda'):
+    """
+    Load pre-computed EEG latents and prepare them in the format expected by InfinityStar.
+    
+    Args:
+        eeg_latents_path: Path to the .pt file containing EEG latents
+        sample_idx: Index of the sample to use (0-based)
+        device: Device to load tensors to
+    
+    Returns:
+        text_cond_tuple: (kv_compact, lens, cu_seqlens_k, Ltext) compatible with InfinityStar
+    """
+    print(f"Loading EEG latents from {eeg_latents_path}...")
+    all_latents = torch.load(eeg_latents_path, map_location='cpu')
+    
+    # all_latents shape: (N, 64, 2048) where N is number of samples
+    if sample_idx < 0 or sample_idx >= all_latents.shape[0]:
+        raise ValueError(f"Invalid sample_idx {sample_idx}. Valid range: 0-{all_latents.shape[0]-1}")
+    
+    # Select specific sample
+    eeg_latent = all_latents[sample_idx]  # (64, 2048)
+    eeg_latent = eeg_latent.to(device).float()
+    
+    print(f"Selected EEG sample {sample_idx}, shape: {eeg_latent.shape}")
+    
+    # Construct text_cond_tuple format: (kv_compact, lens, cu_seqlens_k, Ltext)
+    # EEG latents are fixed length 64, no padding removal needed
+    kv_compact = eeg_latent  # (64, 2048)
+    lens = [64]
+    cu_seqlens_k = torch.tensor([0, 64], dtype=torch.int32, device=device)
+    Ltext = 64
+    
+    text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
+    return text_cond_tuple
+
+
 def _init_prompt_rewriter():
     from tools.prompt_rewriter import OpenAIGPTModel
     """Initialize the OpenAI GPT model."""
@@ -59,7 +95,7 @@ class InferencePipe:
 
 def perform_inference(pipe, data, args):
     
-    prompt = data["prompt"]
+    prompt = data.get("prompt", "")
     seed = data["seed"]
     mapped_duration=5
     num_frames=81
@@ -88,11 +124,25 @@ def perform_inference(pipe, data, args):
 
     generated_image_list = []
     negative_prompt=''
-    # prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'
-    prompt = f'{prompt}'
+    
+    # Check if using EEG latents mode
+    if hasattr(args, 'use_eeg_latents') and args.use_eeg_latents:
+        # EEG mode: Load pre-computed latents
+        print("=" * 60)
+        print(f"Using EEG Latents Mode")
+        print(f"Loading EEG sample index: {args.eeg_sample_idx}")
+        print("=" * 60)
+        eeg_latents_path = 'eeg_alignment_results/sub10_latents.pt'
+        text_cond_tuple = load_and_prepare_eeg_latents(eeg_latents_path, args.eeg_sample_idx, device='cuda')
+        prompt = ""  # Not used in EEG mode
+    else:
+        # Text mode: Use standard prompt encoding
+        prompt = f'{prompt}'
+        if args.append_duration2caption:
+            prompt = f'<<<t={mapped_duration}s>>>' + prompt
+        text_cond_tuple = None  # Will be computed in gen_one_example
+    
     negative_prompt = ""
-    if args.append_duration2caption:
-        prompt = f'<<<t={mapped_duration}s>>>' + prompt
     
     start_time = time.time()
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
@@ -118,6 +168,7 @@ def perform_inference(pipe, data, args):
             get_visual_rope_embeds=pipe.get_visual_rope_embeds,
             context_info=context_info,
             noise_list=None,
+            text_cond_tuple=text_cond_tuple,
         )
         if len(generated_image.shape) == 3:
             generated_image = generated_image.unsqueeze(0)
@@ -135,11 +186,27 @@ def perform_inference(pipe, data, args):
 
 
 if __name__ == '__main__':
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='InfinityStar Video Generation')
+    parser.add_argument('--use_eeg_latents', action='store_true', 
+                        help='Use EEG latents instead of text prompt')
+    parser.add_argument('--eeg_sample_idx', type=int, default=0,
+                        help='Index of EEG sample to use (0-1399 for sub10_latents.pt)')
+    parser.add_argument('--seed', type=int, default=41,
+                        help='Random seed for generation')
+    parser.add_argument('--prompt', type=str, default="a jellyfish swimming in a tank",
+                        help='Text prompt (only used if --use_eeg_latents is not set)')
+    parser.add_argument('--image_path', type=str, default=None,
+                        help='Path to reference image for image-to-video generation')
+    parser.add_argument('--enable_rewriter', type=int, default=0,
+                        help='Enable prompt rewriter (requires OpenAI API key)')
+    cmd_args = parser.parse_args()
+    
     # For optimal performance, enabling the prompt rewriter is recommended.
     # To utilize the GPT model, ensure the following environment variables are set:
     # export OPEN_API_KEY="YOUR_API_KEY"
     # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
-    enable_rewriter=0
+    enable_rewriter = cmd_args.enable_rewriter
     checkpoints_dir = './checkpoints/'
     
 
@@ -170,23 +237,28 @@ if __name__ == '__main__':
     args.semantic_scales=12
     args.max_repeat_times=10000
     args.enable_rewriter=enable_rewriter
+    
+    # Add EEG-specific arguments
+    args.use_eeg_latents = cmd_args.use_eeg_latents
+    args.eeg_sample_idx = cmd_args.eeg_sample_idx
 
     # load models
     pipe = InferencePipe(args)
 
     
-    # prompt = "A handsome smiling gardener inspecting plants, realistic cinematic lighting, detailed textures, ultra-realistic"
-    prompt = "a jellyfish swimming in a tank"
-    # image_path = 'assets/reference_image.webp'  # Remove this for Text-to-Video (T2V) generation
-    image_path = None
+    # Setup data dict
+    prompt = cmd_args.prompt
+    image_path = cmd_args.image_path
+    seed = cmd_args.seed
+    
     data = {
-        'seed': 41,
+        'seed': seed,
         'image_path': image_path,
         'prompt': prompt,
     }
-    if args.enable_rewriter:
-        # Step 1: Rewrite the prompt using GPT
-        # rewritten_prompt = prompt
+    
+    if args.enable_rewriter and not args.use_eeg_latents:
+        # Step 1: Rewrite the prompt using GPT (only in text mode)
         rewritten_prompt = pipe.gpt_model(
             prompt = ("Rewrite the following video descriptions, add more details of the subject and the camera movement to enhance the quality of the video. Do not use the word 'they' to refer to a single person or object. Concatenate all sentences together, not present them in paragraphs. Please rewrite with concise and clear language: "
                     + prompt),
@@ -194,11 +266,19 @@ if __name__ == '__main__':
         )
         print(f"Rewritten prompt: {rewritten_prompt}")
         prompt = rewritten_prompt
-    data['prompt'] = prompt
+        data['prompt'] = prompt
                 
     output_dict = perform_inference(pipe, data, args)
     save_dir = 'output'
-    gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), f'demo.mp4')
+    
+    # Generate appropriate filename based on mode
+    if args.use_eeg_latents:
+        video_filename = f'eeg_sample_{args.eeg_sample_idx}_seed_{seed}.mp4'
+    else:
+        video_filename = f'text_demo_seed_{seed}.mp4'
+    
+    gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), video_filename)
     save_video(output_dict['output'], fps=args.fps, save_filepath=gen_video_path)
             
-    print(f"Video genernation done: {gen_video_path=}")
+    print(f"Video generation done: {gen_video_path=}")
+    print(f"Elapsed time: {output_dict['elapsed_time']:.2f}s")

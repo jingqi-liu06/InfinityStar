@@ -34,6 +34,91 @@ from infinity.dataset.dataset_alignment import EEGAlignmentDataset, collate_alig
 from tools.run_infinity import load_tokenizer
 
 
+class ClipLoss(nn.Module):
+    def __init__(
+            self,
+            local_loss=False,
+            gather_with_grad=False,
+            cache_labels=False,
+            rank=0,
+            world_size=1,
+            use_horovod=False,
+    ):
+        super().__init__()
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.cache_labels = cache_labels
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+        # cache state
+        self.prev_num_logits = 0
+        self.labels = {}
+
+    def get_ground_truth(self, device, num_logits) -> torch.Tensor:
+        """Calculate ground-truth and cache if enabled"""
+        if self.prev_num_logits != num_logits or device not in self.labels:
+            labels = torch.arange(num_logits, device=device, dtype=torch.long)
+            if self.world_size > 1 and self.local_loss:
+                labels = labels + num_logits * self.rank
+            if self.cache_labels:
+                self.labels[device] = labels
+                self.prev_num_logits = num_logits
+        else:
+            labels = self.labels[device]
+        return labels
+
+    def get_logits(self, image_features, text_features, logit_scale, logit_bias=None):
+        """Compute logits between image and text features"""
+        # For single-GPU training (world_size=1), simplified version
+        if self.world_size == 1:
+            logits_per_image = logit_scale * image_features @ text_features.T
+            logits_per_text = logit_scale * text_features @ image_features.T
+        else:
+            # Distributed training would need gather_features implementation
+            raise NotImplementedError("Distributed training not implemented yet")
+
+        if logit_bias is not None:
+            logits_per_image += logit_bias
+            logits_per_text += logit_bias
+
+        return logits_per_image, logits_per_text
+
+    def forward(
+            self,
+            image_features,
+            text_features,
+            logit_scale,
+            logit_bias=None,
+            output_dict=False,
+    ):
+        """
+        Args:
+            image_features: (B, D) normalized features (EEG in our case)
+            text_features: (B, D) normalized features
+            logit_scale: scalar or learnable parameter for scaling
+            logit_bias: optional bias term
+            output_dict: whether to return dict or scalar
+        """
+        device = image_features.device
+        logits_per_image, logits_per_text = self.get_logits(
+            image_features,
+            text_features,
+            logit_scale,
+            logit_bias=logit_bias,
+        )
+
+        labels = self.get_ground_truth(device, logits_per_image.shape[0])
+
+        total_loss = (
+            F.cross_entropy(logits_per_image, labels) +
+            F.cross_entropy(logits_per_text, labels)
+        ) / 2
+
+        return {"contrastive_loss": total_loss} if output_dict else total_loss
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train EEG-Text Alignment")
     
@@ -77,31 +162,6 @@ def parse_args():
     parser.add_argument('--exp_name', type=str, default='mlp_align', help='Wandb experiment name')
     
     return parser.parse_args()
-
-
-def contrastive_loss(eeg_feats, text_feats, temperature=0.07):
-    """
-    Compute Contrastive Loss (InfoNCE).
-    
-    Args:
-        eeg_feats: (B, D) Normalized EEG features
-        text_feats: (B, D) Normalized Text features
-        temperature: Temperature scaling factor
-        
-    Returns:
-        loss: Scalar loss
-    """
-    # Cosine similarity matrix: (B, B)
-    logits = torch.matmul(eeg_feats, text_feats.T) / temperature
-    
-    # Labels: diagonal are positives (0, 1, 2, ...)
-    labels = torch.arange(logits.size(0), device=logits.device)
-    
-    # Cross entropy loss (symmetric)
-    loss_e2t = F.cross_entropy(logits, labels)
-    loss_t2e = F.cross_entropy(logits.T, labels)
-    
-    return (loss_e2t + loss_t2e) / 2
 
 
 def precompute_text_embeddings(dataset, tokenizer, text_encoder, device, batch_size=32):
@@ -227,9 +287,25 @@ def train(args):
     )
     projector.to(device)
     
-    # Optimizer
+    # Initialize CLIP-style Contrastive Loss
+    print("Initializing CLIP Loss...")
+    clip_loss_fn = ClipLoss(
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=True,
+        rank=0,
+        world_size=1,
+        use_horovod=False
+    )
+    
+    # Learnable temperature parameter (logit_scale)
+    # Initialize with 1/temperature, as in CLIP
+    logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1.0 / args.temperature)))
+    logit_scale.to(device)
+    
+    # Optimizer (include logit_scale)
     optimizer = torch.optim.AdamW(
-        projector.parameters(),
+        list(projector.parameters()) + [logit_scale],
         lr=args.lr,
         weight_decay=args.weight_decay
     )
@@ -277,11 +353,17 @@ def train(args):
             # MSE Loss (Reconstruction)
             mse_loss = F.mse_loss(eeg_gap, text_gap)
             
-            # Contrastive Loss (InfoNCE)
+            # CLIP-style Contrastive Loss
             # Normalize for cosine similarity
             eeg_norm = F.normalize(eeg_gap, p=2, dim=-1)
             text_norm = F.normalize(text_gap, p=2, dim=-1)
-            nce_loss = contrastive_loss(eeg_norm, text_norm, temperature=args.temperature)
+            # Use learnable logit_scale (exp to ensure positive)
+            nce_loss = clip_loss_fn(
+                image_features=eeg_norm,
+                text_features=text_norm,
+                logit_scale=logit_scale.exp(),
+                output_dict=False
+            )
             
             # Total Loss
             loss = (args.lambda_mse * mse_loss) + (args.lambda_nce * nce_loss)
@@ -329,6 +411,7 @@ def train(args):
                 'epoch': epoch,
                 'projector': projector.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'logit_scale': logit_scale.data,
                 'loss': avg_loss
             }, save_path)
             
@@ -339,6 +422,7 @@ def train(args):
                     'epoch': epoch,
                     'projector': projector.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'logit_scale': logit_scale.data,
                     'loss': avg_loss
                 }, best_path)
                 print(f"New best model saved to {best_path}")
@@ -349,6 +433,7 @@ def train(args):
                     'epoch': epoch,
                     'projector': projector.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'logit_scale': logit_scale.data,
                     'loss': avg_loss
                 }, periodic_path)
     
