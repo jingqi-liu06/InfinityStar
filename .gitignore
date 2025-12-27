@@ -66,3 +66,4 @@ infinity_output_gt
 eeg_outputs
 eeg_lora_checkpoints/
 pyrightconfig.json
+eeg_alignment_results/
