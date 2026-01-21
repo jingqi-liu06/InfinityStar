@@ -29,8 +29,10 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.append(os.getcwd())
 
-from infinity.models.eeg_projector import build_eeg_projector
+from infinity.models.eeg_projector import build_eeg_projector, EEGProjector
 from infinity.dataset.dataset_alignment import EEGAlignmentDataset, collate_alignment_batch
+from infinity.dataset.dataset_raw import EEGAlignmentRawDataset
+from infinity.models.custom_encoders import deepnet, eegnet, shallownet, glmnet
 from tools.run_infinity import load_tokenizer
 
 
@@ -119,12 +121,34 @@ class ClipLoss(nn.Module):
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
+class EEGEncoderSystem(nn.Module):
+    """
+    Combines a raw EEG encoder (DeepNet/EEGNet/etc.) with a Projector (MLP).
+    """
+    def __init__(self, encoder, projector):
+        super().__init__()
+        self.encoder = encoder
+        self.projector = projector
+        
+    def forward(self, x):
+        # x: (B, 1, C, T)
+        # Encoder returns (B, Embed_Dim)
+        feats = self.encoder(x, return_features=True)
+        # Projector returns (B, Seq, T5_Dim)
+        out = self.projector(feats)
+        return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train EEG-Text Alignment")
     
     # Data paths
-    parser.add_argument('--eeg_tokenizer_path', type=str, required=True,
-                        help='Path to EEG tokenizer output .pt file')
+    parser.add_argument('--eeg_tokenizer_path', type=str, default=None,
+                        help='Path to EEG tokenizer output .pt file (for legacy mode)')
+    parser.add_argument('--raw_eeg_path', type=str, default=None,
+                        help='Path to raw EEG .npy file (for raw mode)')
+    parser.add_argument('--raw_stats_path', type=str, default=None,
+                        help='Where to save raw EEG stats (.npz) for inference reuse')
     parser.add_argument('--video_gt_root', type=str, required=True,
                         help='Root directory for videos (for alignment verification)')
     parser.add_argument('--caption_root', type=str, required=True,
@@ -133,7 +157,10 @@ def parse_args():
                         help='Path to T5 text encoder checkpoint')
     
     # Projector config
-    parser.add_argument('--eeg_dim', type=int, default=14880, help='Input EEG dimension')
+    parser.add_argument('--encoder_model', type=str, default='deepnet', 
+                        choices=['deepnet', 'eegnet', 'shallownet', 'glmnet', 'none'],
+                        help='Type of EEG encoder for raw data. Use "none" for tokenizer input.')
+    parser.add_argument('--eeg_dim', type=int, default=14880, help='Input EEG dimension (if using tokenizer)')
     parser.add_argument('--eeg_seq_len', type=int, default=64, help='Output sequence length')
     parser.add_argument('--eeg_hidden_dim', type=int, default=4096, help='Hidden dimension')
     parser.add_argument('--eeg_num_layers', type=int, default=2, help='Number of layers')
@@ -149,12 +176,13 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--log_freq', type=int, default=10)
-    parser.add_argument('--save_freq', type=int, default=10)
+    parser.add_argument('--save_freq', type=int, default=40)
     parser.add_argument('--preload_data', action='store_true', default=True, help='Preload EEG data to GPU')
     
     # Loss config
     parser.add_argument('--temperature', type=float, default=0.07, help='Temperature for contrastive loss')
     parser.add_argument('--lambda_nce', type=float, default=1.0, help='Weight for NCE loss')
+    # NOTE: No need to tune this.
     parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE loss')
     
     # Wandb config
@@ -193,11 +221,9 @@ def precompute_text_embeddings(dataset, tokenizer, text_encoder, device, batch_s
                 attention_mask=text_tokens.attention_mask
             )
             # We need to store both embeddings and mask
-            # Move to CPU to save GPU memory if dataset is huge, 
-            # but for 1400 samples, keeping on GPU is fine and faster.
-            # Let's keep on GPU for max speed since we have few captions.
-            text_emb = text_outputs['last_hidden_state'] # (B, L, 2048)
-            text_mask = text_tokens.attention_mask.unsqueeze(-1) # (B, L, 1)
+            # Move to CPU to save GPU memory and avoid multiprocessing issues
+            text_emb = text_outputs['last_hidden_state'].cpu() # (B, L, 2048)
+            text_mask = text_tokens.attention_mask.unsqueeze(-1).cpu() # (B, L, 1)
             
             for j, caption in enumerate(batch_captions):
                 cache[caption] = (text_emb[j], text_mask[j])
@@ -229,15 +255,33 @@ def train(args):
     
     # Initial dataset load (to get captions)
     print("Loading Dataset Metadata...")
+    
+    if args.raw_eeg_path and args.encoder_model != 'none':
+        print(f"Using Raw EEG Dataset with {args.encoder_model}...")
+        DatasetClass = EEGAlignmentRawDataset
+        # Dataset kwargs
+        ds_kwargs = {
+            'raw_eeg_path': args.raw_eeg_path,
+            'caption_root': args.caption_root,
+            'video_root': args.video_gt_root,
+            'seed': args.seed,
+            'raw_stats_path': args.raw_stats_path,
+        }
+    else:
+        print("Using Tokenizer Output Dataset...")
+        if args.eeg_tokenizer_path is None:
+            raise ValueError("Must provide --eeg_tokenizer_path if not using raw EEG")
+        DatasetClass = EEGAlignmentDataset
+        ds_kwargs = {
+            'eeg_tokenizer_path': args.eeg_tokenizer_path,
+            'caption_root': args.caption_root,
+            'video_root': args.video_gt_root,
+            'seed': args.seed,
+            'preload_to_gpu': False # Handle preload logic later
+        }
+
     # Temporarily create dataset without preload to scan captions
-    temp_dataset = EEGAlignmentDataset(
-        eeg_tokenizer_path=args.eeg_tokenizer_path,
-        caption_root=args.caption_root,
-        video_root=args.video_gt_root,
-        split="train",
-        seed=args.seed,
-        preload_to_gpu=False
-    )
+    temp_dataset = DatasetClass(split="train", **ds_kwargs)
     
     # Pre-compute text embeddings
     cached_embeddings = precompute_text_embeddings(
@@ -252,39 +296,98 @@ def train(args):
     
     # Re-initialize dataset with cache and preloading
     print("Initializing Optimized Dataset...")
-    dataset = EEGAlignmentDataset(
-        eeg_tokenizer_path=args.eeg_tokenizer_path,
-        caption_root=args.caption_root,
-        video_root=args.video_gt_root,
-        split="train",
-        seed=args.seed,
-        preload_to_gpu=args.preload_data,
-        device=device,
-        cached_text_embeddings=cached_embeddings
-    )
-    
+    if args.raw_eeg_path:
+        # Raw dataset doesn't support preload_to_gpu arg currently in same way, 
+        # or it handles it internally if we added it. 
+        # For now, let's assume it loads to CPURAM and yields tensors.
+        dataset = DatasetClass(
+            split="train", 
+            cached_text_embeddings=cached_embeddings,
+            device=device,
+            **ds_kwargs
+        )
+        # Verify Sample Shape to configure Encoder
+        sample_item = dataset[0]['eeg_features'] # (1, C, T)
+        _, C_dim, T_dim = sample_item.shape
+        print(f"Detected Raw EEG Shape: Channels={C_dim}, Time={T_dim}")
+        
+    else:
+        ds_kwargs['preload_to_gpu'] = args.preload_data
+        dataset = DatasetClass(
+            split="train",
+            cached_text_embeddings=cached_embeddings,
+            device=device,
+            **ds_kwargs
+        )
+
     # DataLoader
     # Note: num_workers=0 is usually faster if data is already on GPU
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0 if args.preload_data else args.num_workers,
+        num_workers=args.num_workers, # Raw data might need workers
         collate_fn=collate_alignment_batch,
         drop_last=True
     )
     
-    # Build EEG Projector
-    print("Building EEG Projector...")
-    projector = build_eeg_projector(
-        projector_type=args.eeg_projector_type,
-        eeg_dim=args.eeg_dim,
-        t5_dim=2048,  # Flan-T5-XL dimension
-        seq_len=args.eeg_seq_len,
-        hidden_dim=args.eeg_hidden_dim,
-        num_layers=args.eeg_num_layers,
-        dropout=args.dropout
-    )
+    # Build EEG Projector/Encoder
+    print("Building EEG Model...")
+    
+    if args.raw_eeg_path and args.encoder_model != 'none':
+        # 1. Build Encoder
+        if args.encoder_model == 'deepnet':
+            encoder = deepnet(out_dim=1, C=C_dim, T=T_dim) # out_dim ignored for return_features
+        elif args.encoder_model == 'eegnet':
+            encoder = eegnet(out_dim=1, C=C_dim, T=T_dim)
+        elif args.encoder_model == 'shallownet':
+            encoder = shallownet(out_dim=1, C=C_dim, T=T_dim)
+        elif args.encoder_model == 'glmnet':
+            # glmnet requires specific channel indices for occipital region
+            # We will use all channels for now or default indices if provided
+            # Assuming standard 62-channel layout or similar.
+            # Original code used: OCCIPITAL_IDX = list(range(50, 62))
+            # Let's try to detect if we have enough channels, otherwise use all.
+            if C_dim >= 62:
+                occ_idx = list(range(50, 62))
+            else:
+                occ_idx = list(range(C_dim)) # Use all if fewer
+            
+            encoder = glmnet(occipital_idx=occ_idx, C=C_dim, T=T_dim, out_dim=1)
+        else:
+            raise ValueError(f"Unknown encoder: {args.encoder_model}")
+            
+        # Get encoder output dim
+        enc_out_dim = encoder.out_features
+        print(f"Encoder output dimension: {enc_out_dim}")
+        
+        # 2. Build Projector (Adapter)
+        # Maps Encoder Features -> T5 Sequence
+        projector_head = build_eeg_projector(
+            projector_type=args.eeg_projector_type,
+            eeg_dim=enc_out_dim, # Input is encoder features
+            t5_dim=2048,
+            seq_len=args.eeg_seq_len,
+            hidden_dim=args.eeg_hidden_dim,
+            num_layers=args.eeg_num_layers,
+            dropout=args.dropout
+        )
+        
+        # 3. Combine
+        projector = EEGEncoderSystem(encoder, projector_head)
+        
+    else:
+        # Legacy/Tokenizer Mode
+        projector = build_eeg_projector(
+            projector_type=args.eeg_projector_type,
+            eeg_dim=args.eeg_dim,
+            t5_dim=2048,  # Flan-T5-XL dimension
+            seq_len=args.eeg_seq_len,
+            hidden_dim=args.eeg_hidden_dim,
+            num_layers=args.eeg_num_layers,
+            dropout=args.dropout
+        )
+        
     projector.to(device)
     
     # Initialize CLIP-style Contrastive Loss
@@ -303,11 +406,20 @@ def train(args):
     logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1.0 / args.temperature)))
     logit_scale.to(device)
     
-    # Optimizer (include logit_scale)
+    # FEAT: Optimizer (Separate Weight Decay)
+    # Filter parameters to apply weight decay only to weights (dim >= 2), not biases or norms
+    param_dict = {pn: p for pn, p in projector.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': args.weight_decay},
+        {'params': nodecay_params + [logit_scale], 'weight_decay': 0.0}
+    ]
+    
     optimizer = torch.optim.AdamW(
-        list(projector.parameters()) + [logit_scale],
-        lr=args.lr,
-        weight_decay=args.weight_decay
+        optim_groups,
+        lr=args.lr
     )
     
     print(f"Start training for {args.epochs} epochs...")
@@ -326,7 +438,7 @@ def train(args):
             optimizer.zero_grad()
             
             # Data is likely already on GPU if preloaded
-            eeg_features = batch['eeg_features'].to(device).float() # (B, 14880)
+            eeg_features = batch['eeg_features'].to(device).float() # (B, 14880) or (B, 1, C, T)
             
             # 1. Forward Pass Projector
             eeg_emb = projector(eeg_features) # (B, Seq, 2048)
